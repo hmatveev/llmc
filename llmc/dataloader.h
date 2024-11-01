@@ -132,6 +132,12 @@ void dataloader_advance_(DataLoader *loader) {
     // advance the loader by loading the next data shard and resetting the position
     loader->current_shard_idx = (loader->current_shard_idx + 1) % loader->glob_result.gl_pathc;
     loader->current_sample_idx = 0;
+    
+    // Print when switching to new shard file
+    printf("[Process %d] 📂 Loading next batch from shard: %s\n", 
+           loader->process_rank, 
+           loader->glob_result.gl_pathv[loader->current_shard_idx]);
+    
     dataloader_load_shard_(loader, (int) loader->current_shard_idx);
 
     if (loader->should_shuffle) {
@@ -146,6 +152,8 @@ void dataloader_init(DataLoader *loader,
                      int process_rank,
                      int num_processes,
                      int should_shuffle) {
+    printf("[Process %d] 🔄 Initializing DataLoader '%s' with batch_size=%zu, seq_len=%zu, processes=%d/%d, shuffle=%s\n",
+           process_rank, filename_pattern, B, T, process_rank, num_processes, should_shuffle ? "yes" : "no");
     loader->process_rank = process_rank;
     loader->num_processes = num_processes;
     loader->B = B;
@@ -198,6 +206,15 @@ void dataloader_init(DataLoader *loader,
 
     // reset the loader, to initialize it
     dataloader_reset(loader);
+
+    // Print initial shard file
+    printf("[Process %d] 📂 Loading initial batch from shard: %s\n", 
+           loader->process_rank, 
+           loader->glob_result.gl_pathv[loader->current_shard_idx]);
+    printf("  ├─ Shard index: %zu/%zu\n", loader->current_shard_idx + 1, loader->glob_result.gl_pathc);
+    printf("  ├─ Sample index within shard: %zu\n", loader->current_sample_idx);
+    printf("  ├─ Local batch offset: %zu bytes\n", loader->local_batch_offset_bytes);
+    printf("  └─ Global batch offset: %zu bytes\n", loader->header_bytes);
 }
 
 void dataloader_load_batch(DataLoader* loader) {

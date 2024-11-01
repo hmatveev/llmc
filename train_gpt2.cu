@@ -1260,8 +1260,13 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     *step = state_header[10]; // step of the optimization
     model->rng_state = *((unsigned long long*)&state_header[20]); // random number generator state
     model->rng_state_last_update = *((unsigned long long*)&state_header[22]); // last gpt2_update
-    size_t current_shard_idx = *((size_t*)&state_header[30]); // shard index
-    size_t current_sample_idx = *((size_t*)&state_header[32]); // position in shard
+    size_t current_shard_idx = *((size_t*)&state_header[30]);
+    size_t current_sample_idx = *((size_t*)&state_header[32]);
+    printf("[Process %d] 📂 Loading checkpoint from shard: %zu/%zu at position %zu\n",
+           multi_gpu_config.process_rank,
+           current_shard_idx,
+           loader->glob_result.gl_pathc,
+           current_sample_idx);
 
     // read AdamW m, v, master_weights (they are all float)
     // allocate all the needed memory as necessary
@@ -1367,6 +1372,7 @@ void error_usage() {
     fprintf(stderr, "Options:\n");
     // file system input / output
     fprintf(stderr, "  -i <string> train data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_train.bin)\n");
+    fprintf(stderr, "  -is <int>   shuffle train data? 0/1 (default = 0)\n");
     fprintf(stderr, "  -j <string> val data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_val.bin)\n");
     fprintf(stderr, "  -e <string> input .bin filename or descriptor, see code comments as docs. (default = gpt2_124M_bf16.bin)\n");
     fprintf(stderr, "  -o <string> output log dir (default = NULL, no logging)\n");
@@ -1419,6 +1425,7 @@ void error_usage() {
 int main(int argc, char *argv[]) {
     // read in the (optional) command line arguments
     const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
+    int shuffle_train_data = 0;
     const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
     const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights of the model
     const char* lr_scheduler_type = "cosine";
@@ -1461,7 +1468,8 @@ int main(int argc, char *argv[]) {
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
         if (!(strlen(argv[i]) == 2 || strlen(argv[i]) == 3)) { error_usage(); } // must be -x[y] (one dash, one or two letters)
         // read in the args
-        if (argv[i][1] == 'i') { train_data_pattern = argv[i+1]; }
+        if (argv[i][1] == 'i' && argv[i][2] == '\0') { train_data_pattern = argv[i+1]; }
+        else if (argv[i][1] == 'i' && argv[i][2] == 's') { shuffle_train_data = atoi(argv[i+1]); }
         else if (argv[i][1] == 'j') { val_data_pattern = argv[i+1]; }
         else if (argv[i][1] == 'e') { load_filename = argv[i+1]; }
         else if (argv[i][1] == 'o') { output_log_dir = argv[i+1]; }
@@ -1525,6 +1533,7 @@ int main(int argc, char *argv[]) {
     printf0("+-----------------------+----------------------------------------------------+\n");
     printf0("| train data pattern    | %-50s |\n", train_data_pattern);
     printf0("| val data pattern      | %-50s |\n", val_data_pattern);
+    printf0("| shuffle train data    | %-50d |\n", shuffle_train_data);
     printf0("| output log dir        | %-50s |\n", output_log_dir == NULL ? "NULL" : output_log_dir);
     printf0("| checkpoint_every      | %-50d |\n", checkpoint_every);
     printf0("| resume                | %-50d |\n", resume);
@@ -1599,7 +1608,7 @@ int main(int argc, char *argv[]) {
     printf0("+-----------------------+----------------------------------------------------+\n");
 
     // build DataLoaders for both train and val
-    int permute_train_loader = (overfit_single_batch == 1) ? 0 : 1;
+    int permute_train_loader = (overfit_single_batch == 1) ? 0 : shuffle_train_data;
     DataLoader train_loader, val_loader;
     dataloader_init(&train_loader, train_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, permute_train_loader);
     dataloader_init(&val_loader, val_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, 0);
@@ -1753,46 +1762,55 @@ int main(int argc, char *argv[]) {
            (step > 0 && (step % sample_every) == 0 || last_step)) {
             NvtxRange generation_range("generation");
             unsigned long long sample_rng_state = 1337;
-            // fill up gen_tokens with the <|endoftext|> token, which kicks off the generation
-            int eot_token = tokenizer.eot_token;
-            for(int i = 0; i < B * T; ++i) {
-                gen_tokens[i] = eot_token;
-            }
-            // now sample from the model autoregressively
-            printf("generating:\n---\n");
-            for (int t = 1; t < genT; t++) {
-                NvtxRange generation_range("Generation step", t);
-                // we try not to be too wasteful for inference by not calculating all of B,T
-                // Using a smaller B is always bit-for-bit identical, but T is more tricky
-                // for non-CUDNN, we need to make sure the attention buffer is memset to 0
-                // for cuDNN, it might suddenly decide to use a slightly different algorithm...
-                // on cuDNN 9.2.1 with cuDNN FrontEnd 1.5.2, T >= 256 seems bit-for-bit identical
-                // (but even if it wasn't fully identical that's probably not the end of the world)
-                // note this is still somewhat wasteful because we don't have a KV cache!
-                gpt2_forward(&model, gen_tokens, 1, CEIL_DIV(t, min(T,256)) * min(T,256));
-                // get the V-dimensional vector probs[0, t-1, :]
-                floatX* logits = model.acts.output + (t - 1) * model.config.padded_vocab_size;
-                // move probs back to CPU and sample (note we only move the first vocab_size logits, ignoring the padding)
-                cudaCheck(cudaMemcpy(cpu_logits_raw, logits, model.config.vocab_size * sizeof(floatX), cudaMemcpyDeviceToHost));
-                // convert to FP32 into cpu_logits (this does nothing useful if floatX == float)
-                for (int i = 0; i < model.config.vocab_size; i++) {
-                    cpu_logits[i] = (float)cpu_logits_raw[i];
+            const char* prompts[] = {
+                "key components of photosynthesis in plants",
+                "2+2=", 
+                "to improve quality of sleep you need",
+                "to sort dictionary in Python",
+                "when you drop Mentos in Coke",
+                "main idea of the book 1984 is",
+                "enemy of my enemy is",
+                "the capital of France is",
+                "water boils at",
+                "the Earth orbits around",
+                "a triangle has"
+            };
+            
+            for (int p = 0; p < 10; p++) {
+                printf("\033[1mPrompt:\033[0m %s\n\033[1mResponse:\033[0m\n", prompts[p]);
+                
+                int eot_token = tokenizer.eot_token;
+                for(int i = 0; i < B * T; ++i) {
+                    gen_tokens[i] = eot_token;
                 }
-                // sample the next token
-                float coin = random_f32(&sample_rng_state);
-                int next_token = sample_softmax(cpu_logits, model.config.vocab_size, coin);
-                gen_tokens[t] = next_token;
-                // print the generated token, either using the Tokenizer or a fallback
-                if (tokenizer.init_ok) {
-                    const char* token_str = tokenizer_decode(&tokenizer, next_token);
-                    safe_printf(token_str);
-                } else {
-                    // fall back to printing the token id
-                    printf("%d ", next_token);
+                
+                const char* prompt = prompts[p];
+                int prompt_len = strlen(prompt);
+                for(int i = 0; i < prompt_len; i++) {
+                    gen_tokens[i] = prompt[i];
                 }
-                fflush(stdout);
+                
+                for (int t = prompt_len; t < prompt_len + 50; t++) {
+                    NvtxRange generation_range("Generation step", t);
+                    gpt2_forward(&model, gen_tokens, 1, CEIL_DIV(t, min(T,256)) * min(T,256));
+                    floatX* logits = model.acts.output + (t - 1) * model.config.padded_vocab_size;
+                    cudaCheck(cudaMemcpy(cpu_logits_raw, logits, model.config.vocab_size * sizeof(floatX), cudaMemcpyDeviceToHost));
+                    for (int i = 0; i < model.config.vocab_size; i++) {
+                        cpu_logits[i] = (float)cpu_logits_raw[i];
+                    }
+                    float coin = random_f32(&sample_rng_state);
+                    int next_token = sample_softmax(cpu_logits, model.config.vocab_size, coin);
+                    gen_tokens[t] = next_token;
+                    if (tokenizer.init_ok) {
+                        const char* token_str = tokenizer_decode(&tokenizer, next_token);
+                        safe_printf(token_str);
+                    } else {
+                        printf("%d ", next_token);
+                    }
+                    fflush(stdout);
+                }
+                printf("\n---\n");
             }
-            printf("\n---\n");
         }
 
         // once in a while checkpoint the optimization state (all ranks)
@@ -1861,17 +1879,30 @@ int main(int argc, char *argv[]) {
         cudaCheck(cudaEventElapsedTime(&time_elapsed_ms, start, end));
         size_t tokens_processed = (size_t)multi_gpu_config.num_processes * B * T * grad_accum_steps;
         float tokens_per_second = tokens_processed / time_elapsed_ms * 1000.0f;
-        float bias_corrected_ema_tokens_per_second = tokens_per_second; // by default set to non-ema version
-        if (step > 0) { // consider the first batch to be a warmup (e.g. cuBLAS/cuDNN initialisation)
+        float bias_corrected_ema_tokens_per_second = tokens_per_second;
+        if (step > 0) {
             total_sum_iteration_time_s += time_elapsed_ms / 1000.0f;
-            // smooth out the tok/s with an exponential moving average, and bias correct just like in AdamW
             ema_tokens_per_second = 0.95f * ema_tokens_per_second + 0.05f * tokens_per_second;
             bias_corrected_ema_tokens_per_second = ema_tokens_per_second / (1.0f - powf(0.95f, step));
         }
         float mfu = gpt2_estimate_mfu(&model, B * T * grad_accum_steps, time_elapsed_ms / 1000.0f);
-        printf0("step %4d/%d | loss %7.6f (%+.2fz)| norm %6.4f (%+.2fz)| lr %.2e | %.2f ms | %.1f%% bf16 MFU | %.0f tok/s\n",
+        
+        // Calculate time per billion tokens
+        float seconds_per_billion = 1000000000.0f / bias_corrected_ema_tokens_per_second;
+        int hours_per_billion = (int)(seconds_per_billion / 3600);
+        int minutes_per_billion = (int)((seconds_per_billion - hours_per_billion * 3600) / 60);
+        
+        // Calculate remaining time
+        int steps_remaining = train_num_batches - (step + 1);
+        float seconds_remaining = steps_remaining * (time_elapsed_ms / 1000.0f);
+        int hours_remaining = (int)(seconds_remaining / 3600);
+        int minutes_remaining = (int)((seconds_remaining - hours_remaining * 3600) / 60);
+
+        printf0("step %4d/%d | loss %7.6f (%+.2fz)| norm %6.4f (%+.2fz)| lr %.2e | %.2f ms | %.1f%% bf16 MFU | %.0f tok/s | %02d:%02d per 1B | %02d:%02d left\n",
                 step + 1, train_num_batches, model.mean_loss, zloss, grad_norm, zgrad, step_learning_rate,
-                time_elapsed_ms, 100*mfu, bias_corrected_ema_tokens_per_second);
+                time_elapsed_ms, 100*mfu, bias_corrected_ema_tokens_per_second,
+                hours_per_billion, minutes_per_billion,
+                hours_remaining, minutes_remaining);
         if(log_gpu_every > 0 && (step + 1) % log_gpu_every == 0) {
             GPUUtilInfo gpu_info = get_gpu_utilization_info();
             printf0("                  compute %2.1f%% | memory: %2.1f%% | fan: %2d%% | %4d MHz / %4d MHz | %3d W / %3d W | %d°C / %d°C | %s\n",
